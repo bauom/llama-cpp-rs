@@ -1,204 +1,92 @@
 # Tool Calling Native Example
 
-This example demonstrates how to use llama.cpp's native tool calling functionality in Rust, providing the same capabilities as the C++ `tool_calling_native.cpp` example.
+This example demonstrates how to implement tool calling with native token classification using the llama-cpp-rs bindings.
 
-## 🎯 Features
+## Key Features
 
-- **Real inference** with actual model execution (not simulated)
-- **Native tool calling** using llama.cpp's built-in chat templates
-- **Tool execution** with result integration back into the conversation
-- **Template detection** automatically detects if the model supports tool calling
-- **Complete workflow** from prompt to tool execution to final response
-- **Command-line interface** similar to the C++ example
+- **Structured Message Parsing**: Uses the same mechanism as `server.cpp` - accumulates tokens and parses them into structured message components
+- **Token Classification**: Classifies tokens by their semantic meaning (thinking, content, tool calls) using `ChatMessage::compute_diffs()`
+- **Real-time Streaming**: Provides classified token streaming with appropriate labels
+- **Tool Support**: Includes example tools for weather and calculations
 
-## 📋 Usage
+## How It Works
 
-```bash
-cargo run --release -- --model /path/to/your/model.gguf [OPTIONS]
-```
+Instead of trying to classify individual tokens, this example:
 
-### Options
+1. **Accumulates tokens** into a complete text buffer during generation
+2. **Periodically parses** the buffer into structured `ChatMessage` objects
+3. **Uses `compute_diffs()`** to determine what content changed and what type it is
+4. **Streams classified content** with appropriate labels (💭 THINKING, 💬 CONTENT, 🔧 TOOL CALL)
 
-- `-m, --model <MODEL_PATH>` - Model file (GGUF format) **[Required]**
-- `-p, --prompt <PROMPT>` - User prompt (default: "Calculate 15 + 25")
-- `-c, --ctx-size <SIZE>` - Context size (default: 4096)
-- `-v, --verbose` - Enable verbose output (shows generated prompts)
-- `-h, --help` - Show help information
+This matches the `server.cpp` approach where token classification comes from message structure analysis rather than individual token inspection.
 
-### Examples
+## Usage
 
 ```bash
-# Basic usage with default calculator prompt
-cargo run --release -- --model ./models/llama-3.1-8b-instruct.gguf
+# Build the example
+cargo build --release
 
-# Custom prompt with verbose output
-cargo run --release -- --model ./models/hermes-2-pro-7b.gguf \
-  --prompt "What is 42 multiplied by 13?" \
-  --verbose
+# Run with a model
+cargo run --release -- --model /path/to/your/model.gguf
 
-# Larger context size for complex conversations
-cargo run --release -- --model ./models/functionary-v3.2.gguf \
-  --ctx-size 8192 \
-  --prompt "Help me calculate some math problems"
+# Customize the prompt
+cargo run --release -- --model /path/to/your/model.gguf --prompt "What's 2+2 and what's the weather in Tokyo?"
+
+# Use CPU only
+cargo run --release -- --model /path/to/your/model.gguf --use-cpu
+
+# Adjust generation parameters
+cargo run --release -- --model /path/to/your/model.gguf --temperature 0.3 --top-p 0.9 --max-tokens 1000
+
+# Using short options
+cargo run --release -- -m /path/to/your/model.gguf -p "What's 2+2?" -n 500 -t 0.5 -k 0.9
+
+# Enable debug mode to see parsing attempts
+cargo run --release -- -m /path/to/your/model.gguf -p "What's the weather?" --debug
 ```
 
-## 🤖 Supported Models
+## Command Line Options
 
-This example works best with models that support native tool calling:
+- `--model` / `-m`: Path to the GGUF model file (required)
+- `--prompt` / `-p`: Input prompt (default: "What's the weather like in San Francisco?")
+- `--max-tokens` / `-n`: Maximum tokens to generate (default: 2048)
+- `--temperature` / `-t`: Sampling temperature (default: 0.7)
+- `--top-p` / `-k`: Top-p sampling (default: 0.95)
+- `--use-cpu` / `-c`: Force CPU usage instead of GPU
+- `--debug` / `-d`: Enable debug output to show parsing attempts
 
-- **Llama 3.1+ Instruct** (8B, 70B, 405B)
-- **Hermes 2 Pro** (7B, 8B)
-- **Functionary v3.1/v3.2**
-- **Qwen 2.5 Instruct**
-- **Mistral Nemo Instruct**
-- **Command R/R+**
-
-For models without native tool calling support, the example will fall back to a generic format.
-
-## 🛠️ What it demonstrates
-
-1. **Model loading and initialization**
-
-   - Backend initialization
-   - Model loading with GGUF format
-   - Chat template initialization
-
-2. **Tool definition and setup**
-
-   - Creating tool schemas with JSON parameters
-   - Tool choice configuration (auto, required, none)
-   - Multiple tool support
-
-3. **Template application with tools**
-
-   - Automatic template format detection
-   - Tool integration into conversation templates
-   - Prompt generation for inference
-
-4. **Real inference execution**
-
-   - Context creation and configuration
-   - Sampling setup (temperature, top-p, etc.)
-   - Token generation and streaming output
-   - End-of-generation detection
-
-5. **Tool call parsing and execution**
-
-   - Response parsing to extract tool calls
-   - JSON argument parsing
-   - Tool execution with error handling
-   - Result integration back into conversation
-
-6. **Complete conversation flow**
-   - Multi-turn conversation support
-   - Tool result integration
-   - Continuation prompt generation
-
-## 🧮 Built-in Calculator Tool
-
-The example includes a simple calculator tool that can:
-
-- Add numbers: "15 + 25" → 40
-- Multiply numbers: "42 \* 13" → 546
-- Handle unknown expressions with graceful fallback
-
-This matches the behavior of the C++ example exactly.
-
-## 📊 Output Example
+## Example Output
 
 ```
-🦙 Native Tool Calling Example
-================================
+🦙 Llama.cpp Tool Calling Example
+Model: /path/to/model.gguf
+Prompt: What's the weather like in San Francisco?
+...
 
-🔧 Initializing llama backend...
-✅ Backend initialized
-📂 Loading model: ./models/llama-3.1-8b-instruct.gguf
-✅ Model loaded successfully
+🤖 Starting generation with structured parsing...
 
-🎭 Initializing chat templates...
-✅ Templates initialized
-Template was explicit: true
+💭 [THINKING] I need to get weather information for San Francisco. I'll use the get_weather tool.
 
-🛠️  Setting up tools...
-✓ Calculator tool added
+💬 [CONTENT] I'll help you get the current weather for San Francisco.
 
-💬 Creating conversation...
-👤 User: Calculate 15 + 25
+🔧 [TOOL CALL 0] Name: get_weather, Args: {"location": "San Francisco, CA", "unit": "fahrenheit"}
 
-🎨 Applying chat template with tools...
-✅ Template applied successfully
-🎭 Format: Llama3XWithBuiltinTools
-📏 Prompt length: 892 characters
-
-🚀 Starting inference...
-✅ Context created (size: 4096)
-📊 Prompt tokens: 178
-
-🤖 Assistant: I'll help you calculate 15 + 25.
-
-<tool_call>
-{"name": "calculator", "arguments": {"expression": "15 + 25"}, "id": "call_123"}
-</tool_call>
-
-✅ Inference completed!
-
-🔍 Parsing response for tool calls...
-✅ Response parsed successfully
+🎯 Final Parsed Message:
 Role: assistant
-Content: I'll help you calculate 15 + 25.
-
-🛠️ Tool calls found:
-  - Name: calculator
-    Arguments: {"expression": "15 + 25"}
-    ID: call_123
-🔧 Executing calculator with: {"expression": "15 + 25"}
-    Result: {"result": 40}
-
-🔄 Tool execution result added to conversation.
-📋 Final prompt for continuation ready (1157 chars)
-
-🎯 Tool calling template applied successfully!
-📋 Summary:
-   • Model: ./models/llama-3.1-8b-instruct.gguf
-   • Tools: 1 defined
-   • Template format: Llama3XWithBuiltinTools
-   • Prompt processed and inference completed
-
-✅ Model supports native tool calling!
-🚀 Tool calling workflow completed successfully!
-
-🧹 Cleaning up...
-✅ Tool calling example completed successfully!
+💭 Reasoning: I need to get weather information for San Francisco. I'll use the get_weather tool.
+💬 Content: I'll help you get the current weather for San Francisco.
+🔧 Tool Calls:
+  [0] get_weather: {"location": "San Francisco, CA", "unit": "fahrenheit"}
 ```
 
-## 🔍 Technical Details
+## Model Requirements
 
-- **C Wrapper Integration**: Uses the C wrapper layer to access `common/chat.h` functions
-- **Memory Management**: Proper cleanup of all resources (model, context, sampler)
-- **Error Handling**: Comprehensive error handling throughout the workflow
-- **Performance**: Release build optimizations for fast inference
-- **Safety**: All unsafe operations are properly wrapped in safe Rust APIs
+This example works best with models that support:
 
-## 🚀 Performance
+- Function calling (e.g., Hermes, Functionary, Command-R)
+- Reasoning/thinking (e.g., DeepSeek-R1, QwQ)
+- Chat templates with tool support
 
-The example is optimized for performance:
+## Architecture
 
-- Uses release builds by default
-- Efficient memory management
-- Streaming token generation
-- Minimal allocations during inference
-
-## 🔧 Requirements
-
-- Rust 1.70+
-- A GGUF model file (preferably tool-calling capable)
-- Sufficient memory for the model and context
-
-## 📝 Notes
-
-- This implementation provides the same functionality as the C++ `tool_calling_native.cpp` example
-- The calculator tool uses hardcoded results for demonstration (matching the C++ version)
-- Tool calling support depends on the model's built-in capabilities
-- Use `--verbose` to see the generated prompts and debug information
-
-For more advanced tool calling scenarios, extend the tool definitions and execution logic as needed.
+The example demonstrates the key insight from `server.cpp`: **token classification comes from message structure analysis, not individual token inspection**. This approach is more robust and provides better semantic understanding of the generated content.

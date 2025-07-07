@@ -1,4 +1,5 @@
 use std::ffi::{CStr, CString};
+use std::ops::Deref;
 use std::ptr;
 
 use crate::model::LlamaModel;
@@ -468,18 +469,45 @@ impl Drop for ChatTemplates {
     }
 }
 
+/// RAII wrapper that owns a `c_chat_msg` allocated in Rust and frees it with
+/// the matching C helper when dropped.  This guarantees the message outlives
+/// any downstream pointers (e.g. the diff array) while it is still in scope.
+#[derive(Debug)]
+struct RawCMsg {
+    inner: c_chat_msg,
+}
+
+impl RawCMsg {
+    fn as_ptr(&self) -> *const c_chat_msg {
+        &self.inner as *const c_chat_msg
+    }
+}
+
+impl Deref for RawCMsg {
+    type Target = c_chat_msg;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl Drop for RawCMsg {
+    fn drop(&mut self) {
+        unsafe { c_chat_msg_free(&mut self.inner) };
+    }
+}
+
 impl ChatMessage {
     /// Compute differences between two chat messages
     pub fn compute_diffs(
         previous: &ChatMessage,
         new: &ChatMessage,
     ) -> Result<ChatMessageDiffs, Box<dyn std::error::Error>> {
-        // Convert to C messages
+        // Convert to C messages and keep them alive for the lifetime of the diff array
         let previous_c = Self::to_c_message(previous)?;
         let new_c = Self::to_c_message(new)?;
 
-        // Call C function
-        let c_diffs = unsafe { c_chat_msg_compute_diffs(&previous_c, &new_c) };
+        // Call C function using the raw pointers
+        let c_diffs = unsafe { c_chat_msg_compute_diffs(previous_c.as_ptr(), new_c.as_ptr()) };
 
         // Convert back to Rust
         let mut diffs = Vec::new();
@@ -540,20 +568,22 @@ impl ChatMessage {
             }
         }
 
-        // Clean up C memory
+        // Drop the temporary C messages *before* freeing the diff array to
+        // avoid double-free when the diff array re-uses pointers from those
+        // messages.
+        drop(previous_c);
+        drop(new_c);
+
+        // Clean up C memory for the diff array after the messages are gone.
         let mut c_diffs_copy = c_diffs;
         unsafe { c_chat_msg_diff_array_free(&mut c_diffs_copy) };
-
-        // Clean up C messages
-        Self::free_c_message(previous_c);
-        Self::free_c_message(new_c);
 
         Ok(ChatMessageDiffs { diffs })
     }
 
     /// Convert Rust ChatMessage to C representation
-    fn to_c_message(msg: &ChatMessage) -> Result<c_chat_msg, Box<dyn std::error::Error>> {
-        // Create CStrings that will be owned by this function
+    fn to_c_message(msg: &ChatMessage) -> Result<RawCMsg, Box<dyn std::error::Error>> {
+        // Top-level fields
         let role = CString::new(msg.role.clone())?;
         let content = CString::new(msg.content.clone())?;
         let reasoning = msg
@@ -572,84 +602,78 @@ impl ChatMessage {
             .map(|s| CString::new(s.clone()))
             .transpose()?;
 
-        // Convert content parts
-        let mut content_part_strings = Vec::new();
-        let mut c_content_parts = Vec::new();
-        for part in &msg.content_parts {
-            let part_type = CString::new(part.content_type.clone())?;
-            let part_text = CString::new(part.text.clone())?;
-            c_content_parts.push(c_chat_msg_content_part {
-                type_: part_type.as_ptr() as *mut i8,
-                text: part_text.as_ptr() as *mut i8,
-            });
-            content_part_strings.push((part_type, part_text));
-        }
-
-        // Convert tool calls
-        let mut tool_call_strings = Vec::new();
-        let mut c_tool_calls = Vec::new();
-        for call in &msg.tool_calls {
-            let call_name = CString::new(call.name.clone())?;
-            let call_args = CString::new(call.arguments.clone())?;
-            let call_id = CString::new(call.id.clone())?;
-            c_tool_calls.push(c_chat_tool_call {
-                name: call_name.as_ptr() as *mut i8,
-                arguments: call_args.as_ptr() as *mut i8,
-                id: call_id.as_ptr() as *mut i8,
-            });
-            tool_call_strings.push((call_name, call_args, call_id));
-        }
-
-        let c_msg = c_chat_msg {
-            role: role.as_ptr() as *mut i8,
-            content: content.as_ptr() as *mut i8,
-            content_parts: if c_content_parts.is_empty() {
-                ptr::null_mut()
-            } else {
-                c_content_parts.as_ptr() as *mut c_chat_msg_content_part
-            },
-            n_content_parts: c_content_parts.len(),
-            tool_calls: if c_tool_calls.is_empty() {
-                ptr::null_mut()
-            } else {
-                c_tool_calls.as_ptr() as *mut c_chat_tool_call
-            },
-            n_tool_calls: c_tool_calls.len(),
-            reasoning_content: reasoning
-                .as_ref()
-                .map_or(ptr::null_mut(), |s| s.as_ptr() as *mut i8),
-            tool_name: tool_name
-                .as_ref()
-                .map_or(ptr::null_mut(), |s| s.as_ptr() as *mut i8),
-            tool_call_id: tool_call_id
-                .as_ref()
-                .map_or(ptr::null_mut(), |s| s.as_ptr() as *mut i8),
+        // Content parts
+        let c_content_parts = if msg.content_parts.is_empty() {
+            ptr::null_mut()
+        } else {
+            let parts_ptr = unsafe {
+                libc::malloc(
+                    std::mem::size_of::<c_chat_msg_content_part>() * msg.content_parts.len(),
+                ) as *mut c_chat_msg_content_part
+            };
+            if parts_ptr.is_null() {
+                return Err("malloc failed for content parts".into());
+            }
+            for (i, part) in msg.content_parts.iter().enumerate() {
+                unsafe {
+                    let c_part = parts_ptr.add(i);
+                    (*c_part).type_ = CString::new(part.content_type.clone())?.into_raw();
+                    (*c_part).text = CString::new(part.text.clone())?.into_raw();
+                }
+            }
+            parts_ptr
         };
 
-        // We need to leak the memory here because the C function will need it
-        // The caller is responsible for calling free_c_message
-        std::mem::forget(role);
-        std::mem::forget(content);
-        if let Some(s) = reasoning {
-            std::mem::forget(s);
-        }
-        if let Some(s) = tool_name {
-            std::mem::forget(s);
-        }
-        if let Some(s) = tool_call_id {
-            std::mem::forget(s);
-        }
-        std::mem::forget(content_part_strings);
-        std::mem::forget(tool_call_strings);
-        std::mem::forget(c_content_parts);
-        std::mem::forget(c_tool_calls);
+        // Tool calls
+        let c_tool_calls = if msg.tool_calls.is_empty() {
+            ptr::null_mut()
+        } else {
+            let calls_ptr = unsafe {
+                libc::malloc(std::mem::size_of::<c_chat_tool_call>() * msg.tool_calls.len())
+                    as *mut c_chat_tool_call
+            };
+            if calls_ptr.is_null() {
+                // Free already allocated memory before returning an error
+                let mut temp_msg_to_free = c_chat_msg {
+                    role: role.into_raw(),
+                    content: content.into_raw(),
+                    reasoning_content: reasoning.map_or(ptr::null_mut(), |s| s.into_raw()),
+                    tool_name: tool_name.map_or(ptr::null_mut(), |s| s.into_raw()),
+                    tool_call_id: tool_call_id.map_or(ptr::null_mut(), |s| s.into_raw()),
+                    content_parts: c_content_parts,
+                    n_content_parts: msg.content_parts.len(),
+                    tool_calls: ptr::null_mut(),
+                    n_tool_calls: 0,
+                };
+                unsafe {
+                    c_chat_msg_free(&mut temp_msg_to_free);
+                }
+                return Err("malloc failed for tool calls".into());
+            }
+            for (i, call) in msg.tool_calls.iter().enumerate() {
+                unsafe {
+                    let c_call = calls_ptr.add(i);
+                    (*c_call).name = CString::new(call.name.clone())?.into_raw();
+                    (*c_call).arguments = CString::new(call.arguments.clone())?.into_raw();
+                    (*c_call).id = CString::new(call.id.clone())?.into_raw();
+                }
+            }
+            calls_ptr
+        };
 
-        Ok(c_msg)
-    }
+        let c_msg = c_chat_msg {
+            role: role.into_raw(),
+            content: content.into_raw(),
+            content_parts: c_content_parts,
+            n_content_parts: msg.content_parts.len(),
+            tool_calls: c_tool_calls,
+            n_tool_calls: msg.tool_calls.len(),
+            reasoning_content: reasoning.map_or(ptr::null_mut(), |s| s.into_raw()),
+            tool_name: tool_name.map_or(ptr::null_mut(), |s| s.into_raw()),
+            tool_call_id: tool_call_id.map_or(ptr::null_mut(), |s| s.into_raw()),
+        };
 
-    /// Free C message memory
-    fn free_c_message(mut msg: c_chat_msg) {
-        unsafe { c_chat_msg_free(&mut msg) };
+        Ok(RawCMsg { inner: c_msg })
     }
 }
 

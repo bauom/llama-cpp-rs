@@ -1,541 +1,437 @@
 use clap::Parser;
-use encoding_rs;
 use llama_cpp_2::{
     chat::{
-        parse_chat_response, ChatFormat, ChatMessage, ChatSyntax, ChatTemplateInputs,
-        ChatTemplates, ChatTool, ChatToolChoice, ReasoningFormat,
+        chat_format_name, parse_chat_response, ChatMessage, ChatMessageDiff, ChatSyntax,
+        ChatTemplateInputs, ChatTemplates, ChatTool, ChatToolChoice, ReasoningFormat,
     },
-    context::params::LlamaContextParams,
+    context::{params::LlamaContextParams, LlamaContext},
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::{params::LlamaModelParams, AddBos, LlamaModel, Special},
     sampling::LlamaSampler,
+    token::LlamaToken,
+    token_type::LlamaTokenAttr,
 };
-use serde_json;
-use std::num::NonZeroU32;
-use std::panic;
-use std::path::PathBuf;
+use serde_json::json;
+use std::{
+    collections::HashSet,
+    io::Write,
+    num::NonZeroU32,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
+use uuid::Uuid;
 
 #[derive(Parser)]
-#[command(name = "tool_calling_native")]
-#[command(about = "🦙 Native Tool Calling with compute_diffs Example")]
-#[command(
-    long_about = "This example demonstrates llama.cpp's native tool calling system with proper diff-based token classification."
-)]
+#[command(about = "Tool calling example with native token classification")]
 struct Args {
-    /// Model file (GGUF format)
-    #[arg(short = 'm', long = "model")]
-    model_path: PathBuf,
+    #[arg(short, long)]
+    model: PathBuf,
 
-    /// User prompt
-    #[arg(short = 'p', long = "prompt", default_value = "what is 3+3?")]
-    user_prompt: String,
+    #[arg(
+        short,
+        long,
+        default_value = "What's the weather like in San Francisco?"
+    )]
+    prompt: String,
 
-    /// Context size
-    #[arg(short = 'c', long = "ctx-size", default_value = "4096")]
-    ctx_size: u32,
+    #[arg(short = 'n', long, default_value = "2048")]
+    max_tokens: u32,
 
-    /// Verbose output
-    #[arg(short = 'v', long = "verbose")]
-    verbose: bool,
-}
+    #[arg(short, long, default_value = "0.7")]
+    temperature: f32,
 
-fn create_calculator_tool() -> ChatTool {
-    ChatTool {
-        name: "calculator".to_string(),
-        description: "Perform mathematical calculations".to_string(),
-        parameters: r#"{"type": "object", "properties": {"expression": {"type": "string", "description": "Mathematical expression"}}, "required": ["expression"]}"#.to_string(),
-    }
-}
+    #[arg(short = 'k', long, default_value = "0.95")]
+    top_p: f32,
 
-fn execute_calculator(arguments: &str) -> Result<String, Box<dyn std::error::Error>> {
-    println!("🔧 Executing calculator with: {}", arguments);
+    #[arg(short = 'c', long, default_value = "false")]
+    use_cpu: bool,
 
-    // Parse the JSON arguments
-    let args: serde_json::Value = serde_json::from_str(arguments)?;
-    let expression = args["expression"].as_str().unwrap_or("");
+    #[arg(short = 'd', long)]
+    debug: bool,
 
-    // Simple math evaluation for demo
-    if expression.contains("3+3") || expression.contains("3 + 3") {
-        Ok(r#"{"result": 6}"#.to_string())
-    } else if expression.contains("15 + 25") {
-        Ok(r#"{"result": 40}"#.to_string())
-    } else if expression.contains("42 * 13") {
-        Ok(r#"{"result": 546}"#.to_string())
-    } else {
-        Ok(format!(
-            r#"{{"result": "Demo calculator - expression: {}"}}"#,
-            expression
-        ))
-    }
+    #[arg(long, help = "Enable OpenAI-compatible streaming")]
+    oai_stream: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    println!("🦙 Native Tool Calling with compute_diffs Example");
-    println!("==================================================\n");
+    println!("🦙 Llama.cpp Tool Calling Example");
+    println!("Model: {}", args.model.display());
+    println!("Prompt: {}", args.prompt);
+    println!("Max tokens: {}", args.max_tokens);
+    println!("Temperature: {}", args.temperature);
+    println!("Top-p: {}", args.top_p);
+    println!("Use CPU: {}", args.use_cpu);
+    println!("Debug: {}", args.debug);
+    if args.oai_stream {
+        println!("OpenAI Stream: enabled");
+    }
+    println!();
 
-    // Initialize llama backend (following llama_cpp.rs pattern)
-    println!("🔧 Initializing llama backend...");
+    // Initialize backend
     let backend = LlamaBackend::init()?;
-    println!("✅ Backend initialized");
 
-    // Load model with proper parameters
-    println!("📖 Loading model from {:?}...", args.model_path);
-    let model_params = LlamaModelParams::default();
-    let model = LlamaModel::load_from_file(&backend, &args.model_path, &model_params)
-        .map_err(|e| format!("Failed to load model: {}", e))?;
-    println!("✅ Model loaded");
+    // Load model
+    let model_params = if cfg!(feature = "metal") || cfg!(feature = "cuda") && !args.use_cpu {
+        LlamaModelParams::default().with_n_gpu_layers(1000)
+    } else {
+        LlamaModelParams::default()
+    };
 
-    // Create context with proper validation (following llama_cpp.rs pattern)
-    println!("🧠 Creating context...");
-    let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(args.ctx_size));
-    let mut ctx = model
-        .new_context(&backend, ctx_params)
-        .map_err(|e| format!("Failed to create context: {}", e))?;
-    println!("✅ Context created");
+    let model = LlamaModel::load_from_file(&backend, &args.model, &model_params)?;
 
-    // Validate context parameters
-    let n_ctx = ctx.n_ctx();
-    let n_batch = ctx.n_batch();
-    let n_ubatch = ctx.n_ubatch();
+    // Initialize chat templates
+    let chat_templates = ChatTemplates::new(&model, None, None, None)?;
+
+    println!("✅ Model loaded successfully");
     println!(
-        "📊 Context info: n_ctx={}, n_batch={}, n_ubatch={}",
-        n_ctx, n_batch, n_ubatch
+        "📝 Chat template was {}",
+        if chat_templates.was_explicit() {
+            "explicit"
+        } else {
+            "auto-detected"
+        }
     );
 
-    if n_ctx == 0 {
-        return Err("Invalid context: n_ctx is zero".into());
-    }
+    // Define tools
+    let tools = vec![
+        ChatTool {
+            name: "get_weather".to_string(),
+            description: "Get current weather for a location".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city and state, e.g. San Francisco, CA"
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                        "description": "Temperature unit"
+                    }
+                },
+                "required": ["location"]
+            })
+            .to_string(),
+        },
+        ChatTool {
+            name: "calculate".to_string(),
+            description: "Perform mathematical calculations".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "Mathematical expression to evaluate"
+                    }
+                },
+                "required": ["expression"]
+            })
+            .to_string(),
+        },
+    ];
 
-    // Set up tools
-    let tools = vec![create_calculator_tool()];
+    // Create messages
+    let messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: "You are a helpful assistant that can get weather information and perform calculations. Use the available tools when needed.".to_string(),
+            content_parts: vec![],
+            tool_calls: vec![],
+            reasoning_content: None,
+            tool_name: None,
+            tool_call_id: None,
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: args.prompt.clone(),
+            content_parts: vec![],
+            tool_calls: vec![],
+            reasoning_content: None,
+            tool_name: None,
+            tool_call_id: None,
+        },
+    ];
 
-    // Create chat template (following llama_cpp.rs pattern)
-    let chat_templates = ChatTemplates::new(&model, None, None, None)
-        .map_err(|e| format!("Failed to create chat templates: {}", e))?;
-
-    // Create template inputs with proper structure
+    // Create template inputs
     let inputs = ChatTemplateInputs {
-        messages: vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: "You are a helpful assistant. You have access to a calculator tool."
-                    .to_string(),
-                ..Default::default()
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: args.user_prompt.clone(),
-                ..Default::default()
-            },
-        ],
+        messages,
+        grammar: None,
+        json_schema: None,
+        add_generation_prompt: true,
+        use_jinja: true,
         tools,
         tool_choice: ChatToolChoice::Auto,
-        add_generation_prompt: true,
+        parallel_tool_calls: false,
         reasoning_format: ReasoningFormat::DeepSeek,
         enable_thinking: true,
-        ..Default::default()
     };
 
     // Apply chat template
-    let chat_result = chat_templates
-        .apply(&inputs)
-        .map_err(|e| format!("Failed to apply chat template: {}", e))?;
+    let chat_params = chat_templates.apply(&inputs)?;
 
-    let chat_format = chat_result.format;
-    println!("📝 Using chat format: {:?}", chat_format);
-    println!("💬 Formatted chat:\n{}\n", chat_result.prompt);
+    println!("🔧 Chat template applied successfully");
+    println!("📋 Format: {}", chat_format_name(chat_params.format));
+    println!("📏 Prompt length: {} characters", chat_params.prompt.len());
+    println!();
 
-    // Tokenize with validation
-    let tokens = model
-        .str_to_token(&chat_result.prompt, AddBos::Always)
-        .map_err(|e| format!("Failed to tokenize: {}", e))?;
-    println!("🔢 Generated {} tokens", tokens.len());
+    // Initialize context
+    let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(4096));
+    let mut ctx = model.new_context(&backend, ctx_params)?;
 
-    if tokens.is_empty() {
-        return Err("No tokens generated from prompt".into());
+    // Tokenize prompt
+    let tokens = model.str_to_token(&chat_params.prompt, AddBos::Always)?;
+
+    println!("🔤 Tokenized prompt: {} tokens", tokens.len());
+
+    // Collect preserved token IDs from chat template, like in server.cpp
+    let preserved_token_ids: HashSet<LlamaToken> = chat_params
+        .preserved_tokens
+        .iter()
+        .flat_map(|s| model.str_to_token(s, AddBos::Never).unwrap_or_default())
+        .collect();
+
+    if args.debug && !preserved_token_ids.is_empty() {
+        println!("[DEBUG] Preserved token IDs: {:?}", preserved_token_ids);
     }
 
-    if tokens.len() as u32 >= n_ctx {
-        return Err(format!(
-            "Prompt too long: {} tokens >= {} context size",
-            tokens.len(),
-            n_ctx
-        )
-        .into());
-    }
+    // Process prompt
+    let mut batch = LlamaBatch::new(512, 1);
+    let t_start = Instant::now();
 
-    // Initialize batch and process prompt (following llama_cpp.rs pattern)
-    const BATCH_SIZE: usize = 512;
-    let mut batch = LlamaBatch::new(BATCH_SIZE, 1);
-    let last_index = tokens.len() - 1;
-
-    // Process prompt in batches
+    // Add tokens to batch
     for (i, &token) in tokens.iter().enumerate() {
-        if batch.n_tokens() as usize >= BATCH_SIZE {
-            ctx.decode(&mut batch)
-                .map_err(|e| format!("Failed to decode prompt batch: {}", e))?;
+        let is_last = i == tokens.len() - 1;
+        batch.add(token, i as i32, &[0], is_last)?;
+
+        if batch.n_tokens() == 512 || is_last {
+            ctx.decode(&mut batch)?;
             batch.clear();
         }
-
-        let is_last = i == last_index;
-        batch
-            .add(token, i as i32, &[0], is_last)
-            .map_err(|e| format!("Failed to add token to batch: {}", e))?;
     }
 
-    // Final decode for remaining tokens
-    ctx.decode(&mut batch)
-        .map_err(|e| format!("Failed to decode final prompt batch: {}", e))?;
-    println!("✅ Initial prompt processed successfully");
+    let prompt_time = t_start.elapsed();
+    println!("⏱️  Prompt processed in {:?}", prompt_time);
 
-    // Start generation with streaming and compute_diffs
-    println!("🚀 Starting streaming generation with compute_diffs...\n");
+    // Initialize sampler
+    let mut sampler = LlamaSampler::chain_simple(
+        [
+            Some(LlamaSampler::penalties(64, 1.1, 0.0, 0.0)),
+            Some(LlamaSampler::top_p(args.top_p, 1)),
+            Some(LlamaSampler::temp(args.temperature)),
+            Some(LlamaSampler::dist(42)),
+            Some(LlamaSampler::greedy()),
+        ]
+        .into_iter()
+        .flatten(),
+    );
 
-    // Create sampler (following llama_cpp.rs pattern)
-    let chain = [
-        Some(LlamaSampler::penalties(32, 1.1, 0.0, 0.0)), // repetition penalty
-        Some(LlamaSampler::top_p(0.9, 1)),
-        Some(LlamaSampler::temp(0.3)),
-        Some(LlamaSampler::dist(42)), // seed
-    ];
-    let mut sampler = LlamaSampler::chain_simple(chain.into_iter().flatten());
+    // Generation loop following server.cpp approach
+    let mut generated_text = String::new();
+    let mut n_cur = tokens.len() as i32;
+    let t_gen_start = Instant::now();
+    let mut last_parsed_message = ChatMessage::default();
+    let completion_id = format!("cmpl-{}", Uuid::new_v4());
+    let mut is_first_chunk = true;
+    let mut end_of_generation_token_reached = false;
 
-    // Create chat syntax for parsing
+    // Create chat syntax for parsing (when needed)
     let chat_syntax = ChatSyntax {
-        format: chat_format,
+        format: chat_params.format,
         reasoning_format: ReasoningFormat::DeepSeek,
         reasoning_in_content: false,
         thinking_forced_open: false,
         parse_tool_calls: true,
     };
 
-    let mut response = String::new();
-    let mut prev_message = ChatMessage::default();
-    let mut token_count = 0;
-    let mut consecutive_newlines = 0;
-    const MAX_CONSECUTIVE_NEWLINES: usize = 10;
+    println!("🤖 Starting generation...\n");
 
-    // UTF-8 decoder for proper token handling
-    let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut n_past = tokens.len() as i32;
+    // Helper function to determine if a token should be treated as special (following server.cpp)
+    let accept_special_token = |token| -> bool {
+        // In server.cpp this checks: params_base.special || slot.params.sampling.preserved_tokens.find(token) != end()
+        // We will use the preserved tokens from the chat template.
+        preserved_token_ids.contains(&token)
+    };
 
-    // Generation loop (following server.cpp slot pattern)
-    let mut memory_check_interval = 50; // Check memory every 50 tokens
+    for step in 0..args.max_tokens {
+        // Sample next token
+        let new_token = sampler.sample(&ctx, batch.n_tokens() - 1);
+        sampler.accept(new_token);
 
-    for generation_step in 0..512 {
-        if args.verbose {
-            println!(
-                "🔍 DEBUG: Generation step {}, batch tokens: {}",
-                generation_step,
-                batch.n_tokens()
-            );
-
-            // Memory usage check every 50 tokens
-            if generation_step % memory_check_interval == 0 {
-                println!("🔍 DEBUG: Memory check at step {}", generation_step);
-                // Force a small garbage collection hint
-                std::hint::black_box(());
-            }
-        }
-
-        // Sample next token with enhanced safety checks
-        if args.verbose {
-            println!("🔍 DEBUG: About to sample token...");
-        }
-
-        let new_token_id = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let sample_result = sampler.sample(&ctx, batch.n_tokens() - 1);
-            if args.verbose {
-                println!("🔍 DEBUG: Sampler returned token: {}", sample_result);
-            }
-            sample_result
-        })) {
-            Ok(token) => {
-                if args.verbose {
-                    println!("🔍 DEBUG: Successfully sampled token: {}", token);
-                }
-                token
-            }
-            Err(e) => {
-                println!("❌ PANIC in sampler.sample(): {:?}", e);
-                break;
-            }
-        };
-
-        if args.verbose {
-            println!("🔍 DEBUG: About to accept token...");
-        }
-
-        // Accept the token with safety check
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            sampler.accept(new_token_id)
-        })) {
-            Ok(_) => {
-                if args.verbose {
-                    println!("🔍 DEBUG: Successfully accepted token");
-                }
-            }
-            Err(e) => {
-                println!("❌ PANIC in sampler.accept(): {:?}", e);
-                break;
-            }
-        };
-
-        // Check for EOS token
-        if args.verbose {
-            println!("🔍 DEBUG: Checking if token is EOS...");
-        }
-
-        let eos_token = model.token_eos();
-        if new_token_id == eos_token {
-            if args.verbose {
-                println!("🔍 DEBUG: EOS token detected, stopping generation");
-            }
+        // Check if end of generation
+        if model.is_eog_token(new_token) {
+            println!("\n🏁 End of generation token reached");
+            end_of_generation_token_reached = true;
             break;
         }
 
-        // Convert token to text with enhanced error handling
-        if args.verbose {
-            println!("🔍 DEBUG: Converting token to text...");
-        }
-
-        let output_bytes = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            model.token_to_bytes(new_token_id, Special::Tokenize)
-        })) {
-            Ok(bytes) => match bytes {
-                Ok(b) => b,
-                Err(e) => {
-                    println!("❌ Error converting token to bytes: {}", e);
-                    break;
-                }
-            },
-            Err(e) => {
-                println!("❌ PANIC in token_to_bytes(): {:?}", e);
-                break;
-            }
+        // Convert token to text following server.cpp approach
+        let token_str = if accept_special_token(new_token) {
+            // Handle special tokens by getting their raw representation
+            let token_bytes = model.token_to_bytes(new_token, Special::Plaintext)?;
+            String::from_utf8_lossy(&token_bytes).to_string()
+        } else {
+            // Handle regular tokens
+            let token_bytes = model.token_to_bytes(new_token, Special::Tokenize)?;
+            String::from_utf8_lossy(&token_bytes).to_string()
         };
 
-        let mut output_str = String::with_capacity(32);
-        let _decode_result = decoder.decode_to_string(&output_bytes, &mut output_str, false);
+        // Accumulate generated text (following server.cpp approach)
+        generated_text.push_str(&token_str);
 
-        if args.verbose {
-            println!("🔍 DEBUG: Token {} text: {:?}", token_count + 1, output_str);
-        }
+        if args.oai_stream {
+            if let Ok(new_message) = parse_chat_response(&generated_text, true, &chat_syntax) {
+                if is_first_chunk {
+                    let chunk = json!({
+                        "id": &completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                        "model": args.model.to_string_lossy(),
+                        "choices": [{
+                            "index": 0,
+                            "delta": { "role": "assistant", "content": null },
+                            "finish_reason": null
+                        }]
+                    });
+                    println!("data: {}", chunk.to_string());
+                    println!();
+                    std::io::stdout().flush().unwrap();
+                    is_first_chunk = false;
+                }
 
-        response.push_str(&output_str);
-        token_count += 1;
+                // --- simple Rust-side diff (avoid FFI seg-faults) ---
+                let mut delta_obj = json!({});
 
-        // Check for excessive newlines to prevent infinite loops
-        if output_str.trim().is_empty() {
-            consecutive_newlines += 1;
-            if consecutive_newlines > MAX_CONSECUTIVE_NEWLINES {
-                println!("⚠️  Stopping generation due to excessive newlines");
-                break;
+                // Reasoning delta
+                if let (Some(prev), Some(new)) = (
+                    &last_parsed_message.reasoning_content,
+                    &new_message.reasoning_content,
+                ) {
+                    if new.len() > prev.len() {
+                        delta_obj["reasoning"] = json!(new[prev.len()..].to_string());
+                    }
+                } else if let Some(new) = &new_message.reasoning_content {
+                    if !new.is_empty() && last_parsed_message.reasoning_content.is_none() {
+                        delta_obj["reasoning"] = json!(new);
+                    }
+                }
+
+                // Content delta (simple suffix diff)
+                if new_message.content.len() > last_parsed_message.content.len() {
+                    delta_obj["content"] =
+                        json!(new_message.content[last_parsed_message.content.len()..].to_string());
+                }
+
+                // Tool-call delta (any newly added calls)
+                if new_message.tool_calls.len() > last_parsed_message.tool_calls.len() {
+                    let idx = last_parsed_message.tool_calls.len();
+                    for (i, tc) in new_message.tool_calls[idx..].iter().enumerate() {
+                        delta_obj["tool_calls"] = json!([{
+                            "index": idx + i,
+                            "id": tc.id,
+                            "type": "function",
+                            "function": { "name": tc.name, "arguments": tc.arguments }
+                        }]);
+                    }
+                }
+
+                if delta_obj.as_object().map_or(false, |m| !m.is_empty()) {
+                    let chunk = json!({
+                        "id": &completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                        "model": args.model.to_string_lossy(),
+                        "choices": [{
+                            "index": 0,
+                            "delta": delta_obj,
+                            "finish_reason": null
+                        }]
+                    });
+                    println!("data: {}", chunk.to_string());
+                    println!();
+                    std::io::stdout().flush().unwrap();
+                }
+                last_parsed_message = new_message;
             }
         } else {
-            consecutive_newlines = 0;
+            // Print token immediately for streaming effect
+            print!("{}", token_str);
+            std::io::stdout().flush().unwrap();
         }
 
-        // Parse chat response with enhanced error handling
-        if args.verbose {
-            println!("🔍 DEBUG: About to parse chat response...");
-        }
+        // Prepare for next iteration
+        batch.clear();
+        batch.add(new_token, n_cur, &[0], true)?;
+        n_cur += 1;
 
-        let current_message = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let parse_result = parse_chat_response(&response, true, &chat_syntax);
-            if args.verbose {
-                println!("🔍 DEBUG: Parse result: {:?}", parse_result);
-            }
-            parse_result
-        })) {
-            Ok(Ok(msg)) => msg,
-            Ok(Err(_)) => {
-                if args.verbose {
-                    println!("🔍 DEBUG: Parse failed, creating fallback message");
-                }
-                // On parse error, create a minimal message to maintain flow
-                ChatMessage {
-                    role: "assistant".to_string(),
-                    content: response.clone(),
-                    ..Default::default()
-                }
-            }
-            Err(e) => {
-                println!("❌ PANIC in parse_chat_response(): {:?}", e);
-                break;
-            }
-        };
-
-        // Compute diffs with enhanced error handling
-        if args.verbose {
-            println!("🔍 DEBUG: About to compute diffs...");
-        }
-
-        // WORKAROUND: Skip compute_diffs if tool calls are present (causes segfault)
-        let has_tool_calls = !current_message.tool_calls.is_empty();
-        if has_tool_calls {
-            if args.verbose {
-                println!("🔍 DEBUG: Tool calls detected, skipping compute_diffs to avoid segfault");
-            }
-            println!(
-                "📊 Token {}: 🔧 Tool Call Structure: {:?}",
-                token_count, output_str
-            );
-            println!(
-                "   🔧 Tool Call: name='{}', args='{}'",
-                current_message.tool_calls[0].name, current_message.tool_calls[0].arguments
-            );
-        } else {
-            let diffs = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                ChatMessage::compute_diffs(&prev_message, &current_message)
-            })) {
-                Ok(Ok(diff_result)) => diff_result.diffs,
-                Ok(Err(e)) => {
-                    if args.verbose {
-                        println!("🔍 DEBUG: Compute diffs failed: {}", e);
-                    }
-                    Vec::new()
-                }
-                Err(e) => {
-                    println!("❌ PANIC in compute_diffs(): {:?}", e);
-                    break;
-                }
-            };
-
-            // Display token classification
-            if diffs.is_empty() {
-                println!(
-                    "📊 Token {}: ⚪ No structural change = {:?}",
-                    token_count, output_str
-                );
-            } else {
-                println!("📊 Token {}: 🧠 Reasoning: {:?}", token_count, output_str);
-                println!("   📋 Parser found {} diffs total", diffs.len());
-            }
-        }
-
-        prev_message = current_message;
-
-        // Check for tool call completion
-        if response.contains("</tool_call>") {
-            println!("🎯 Tool call completed, stopping generation");
-            break;
-        }
-
-        // Enhanced batch management with safety checks
-        if args.verbose {
-            println!("🔍 DEBUG: About to clear and prepare batch...");
-        }
-
-        // Clear batch with error handling
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            batch.clear();
-        })) {
-            Ok(_) => {
-                if args.verbose {
-                    println!("🔍 DEBUG: Successfully cleared batch");
-                }
-            }
-            Err(e) => {
-                println!("❌ PANIC in batch.clear(): {:?}", e);
-                break;
-            }
-        };
-
-        if args.verbose {
-            println!("🔍 DEBUG: About to add token to batch...");
-        }
-
-        // Add token to batch with error handling
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            batch.add(new_token_id, n_past, &[0], true)
-        })) {
-            Ok(add_result) => match add_result {
-                Ok(_) => {
-                    if args.verbose {
-                        println!("🔍 DEBUG: Successfully added token to batch");
-                    }
-                }
-                Err(e) => {
-                    println!("❌ Error adding token to batch: {}", e);
-                    break;
-                }
-            },
-            Err(e) => {
-                println!("❌ PANIC in batch.add(): {:?}", e);
-                break;
-            }
-        };
-
-        n_past += 1;
-
-        // Only decode if we're not at the end of generation
-        if generation_step < 511 {
-            if args.verbose {
-                println!("🔍 DEBUG: About to decode batch for next iteration...");
-            }
-
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.decode(&mut batch)))
-            {
-                Ok(decode_result) => match decode_result {
-                    Ok(_) => {
-                        if args.verbose {
-                            println!("🔍 DEBUG: Successfully decoded batch");
-                        }
-                    }
-                    Err(e) => {
-                        println!("❌ Decode error at token {}: {}", token_count, e);
-                        break;
-                    }
-                },
-                Err(e) => {
-                    println!("❌ PANIC in ctx.decode(): {:?}", e);
-                    break;
-                }
-            };
-        }
-
-        if args.verbose {
-            println!("🔍 DEBUG: Completed generation step {}", generation_step);
-        }
+        ctx.decode(&mut batch)?;
     }
 
-    // Final cleanup
-    batch.clear();
-    println!("\n🎉 Generation complete! Generated {} tokens", token_count);
-    println!("📝 Final response:\n{}", response);
+    if args.oai_stream {
+        // Send final chunk with finish_reason
+        let final_msg =
+            parse_chat_response(&generated_text, false, &chat_syntax).unwrap_or_default();
+        let finish_reason = if !final_msg.tool_calls.is_empty() {
+            "tool_calls"
+        } else if end_of_generation_token_reached {
+            "stop"
+        } else {
+            "length"
+        };
+        let chunk = json!({
+            "id": &completion_id,
+            "object": "chat.completion.chunk",
+            "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            "model": args.model.to_string_lossy(),
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish_reason
+            }]
+        });
+        println!("data: {}", chunk.to_string());
+        println!();
+        std::io::stdout().flush().unwrap();
 
-    // // Parse final message for tool calls
-    // let final_message = match parse_chat_response(&response, false, &chat_syntax) {
-    //     Ok(msg) => msg,
-    //     Err(e) => {
-    //         println!("❌ Failed to parse final message: {}", e);
-    //         return Ok(());
-    //     }
-    // };
+        println!("data: [DONE]");
+        println!();
+        std::io::stdout().flush().unwrap();
+    }
 
-    // // Execute tool calls if found
-    // if !final_message.tool_calls.is_empty() {
-    //     println!("\n🔧 Found {} tool calls:", final_message.tool_calls.len());
-    //     for (i, tool_call) in final_message.tool_calls.iter().enumerate() {
-    //         println!(
-    //             "   {}. {} with args: {}",
-    //             i + 1,
-    //             tool_call.name,
-    //             tool_call.arguments
-    //         );
+    let gen_time = t_gen_start.elapsed();
 
-    //         if tool_call.name == "calculator" {
-    //             match execute_calculator(&tool_call.arguments) {
-    //                 Ok(result) => println!("      Result: {}", result),
-    //                 Err(e) => println!("      Error: {}", e),
-    //             }
-    //         }
-    //     }
-    // }
+    if !args.oai_stream {
+        println!("\n\n📊 Generation Statistics:");
+        println!("⏱️  Total time: {:?}", gen_time);
+        println!("🔤 Tokens generated: {}", n_cur - tokens.len() as i32);
+        println!(
+            "🚀 Tokens/sec: {:.2}",
+            (n_cur - tokens.len() as i32) as f64 / gen_time.as_secs_f64()
+        );
+
+        // Final structured parsing (following server.cpp approach)
+        println!("\n🎯 Final Parse Results:");
+        if let Ok(final_msg) = parse_chat_response(&generated_text, false, &chat_syntax) {
+            if let Some(reasoning) = &final_msg.reasoning_content {
+                if !reasoning.is_empty() {
+                    println!("💭 [REASONING] {}", reasoning);
+                }
+            }
+            if !final_msg.content.is_empty() {
+                println!("💬 [CONTENT] {}", final_msg.content);
+            }
+            for (i, tool_call) in final_msg.tool_calls.iter().enumerate() {
+                println!(
+                    "🔧 [TOOL CALL {}] Name: {}, Args: {}",
+                    i, tool_call.name, tool_call.arguments
+                );
+            }
+        }
+    }
 
     Ok(())
 }

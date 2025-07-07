@@ -243,6 +243,10 @@ fn main() {
         .allowlist_type("ggml_.*")
         .allowlist_function("llama_.*")
         .allowlist_type("llama_.*")
+        .allowlist_function("common_.*")
+        .allowlist_type("common_.*")
+        .allowlist_function("c_chat_.*")
+        .allowlist_type("c_chat_.*")
         .prepend_enum_name(false)
         .generate()
         .expect("Failed to generate bindings");
@@ -254,6 +258,8 @@ fn main() {
         .expect("Failed to write bindings");
 
     println!("cargo:rerun-if-changed=wrapper.h");
+    println!("cargo:rerun-if-changed=chat_wrapper.h");
+    println!("cargo:rerun-if-changed=chat_wrapper.cpp");
 
     debug_log!("Bindings Created");
 
@@ -278,7 +284,11 @@ fn main() {
         config.define("GGML_BLAS", "OFF");
     }
 
-    if (matches!(target_os, TargetOs::Windows(WindowsVariant::Msvc)) && matches!(profile.as_str(), "Release" | "RelWithDebInfo" | "MinSizeRel"))
+    if (matches!(target_os, TargetOs::Windows(WindowsVariant::Msvc))
+        && matches!(
+            profile.as_str(),
+            "Release" | "RelWithDebInfo" | "MinSizeRel"
+        ))
     {
         // Debug Rust builds under MSVC turn off optimization even though we're ideally building the release profile of llama.cpp.
         // Looks like an upstream bug:
@@ -375,18 +385,76 @@ fn main() {
         .always_configure(false);
 
     let build_dir = config.build();
+    // In newer versions of llama.cpp, build-info.cpp is generated from build-info.cpp.in
+    // so we don't need to move it anymore
     let build_info_src = llama_src.join("common/build-info.cpp");
-    let build_info_target = build_dir.join("build-info.cpp");
-    std::fs::rename(&build_info_src,&build_info_target).unwrap_or_else(|move_e| {
-        // Rename may fail if the target directory is on a different filesystem/disk from the source.
-        // Fall back to copy + delete to achieve the same effect in this case.
-        std::fs::copy(&build_info_src, &build_info_target).unwrap_or_else(|copy_e| {
-            panic!("Failed to rename {build_info_src:?} to {build_info_target:?}. Move failed with {move_e:?} and copy failed with {copy_e:?}");
+    if build_info_src.exists() {
+        let build_info_target = build_dir.join("build-info.cpp");
+        std::fs::rename(&build_info_src,&build_info_target).unwrap_or_else(|move_e| {
+            // Rename may fail if the target directory is on a different filesystem/disk from the source.
+            // Fall back to copy + delete to achieve the same effect in this case.
+            std::fs::copy(&build_info_src, &build_info_target).unwrap_or_else(|copy_e| {
+                panic!("Failed to rename {build_info_src:?} to {build_info_target:?}. Move failed with {move_e:?} and copy failed with {copy_e:?}");
+            });
+            std::fs::remove_file(&build_info_src).unwrap_or_else(|e| {
+                panic!("Failed to delete {build_info_src:?} after copying to {build_info_target:?}: {e:?} (move failed because {move_e:?})");
+            });
         });
-        std::fs::remove_file(&build_info_src).unwrap_or_else(|e| {
-            panic!("Failed to delete {build_info_src:?} after copying to {build_info_target:?}: {e:?} (move failed because {move_e:?})");
-        });
-    });
+    }
+
+    // Build our chat wrapper
+    let wrapper_src = Path::new(&manifest_dir).join("chat_wrapper.cpp");
+    let wrapper_obj = out_dir.join("chat_wrapper.o");
+
+    debug_log!(
+        "Building chat wrapper: {} -> {}",
+        wrapper_src.display(),
+        wrapper_obj.display()
+    );
+
+    // Compile our wrapper along with the chat.cpp file and dependencies
+    let mut wrapper_build = cc::Build::new();
+    wrapper_build
+        .cpp(true)
+        .file(&wrapper_src)
+        .file(&llama_src.join("common/chat.cpp"))
+        .file(&llama_src.join("common/chat-parser.cpp"))
+        .file(&llama_src.join("common/regex-partial.cpp"))
+        .file(&llama_src.join("common/json-partial.cpp"))
+        .file(&llama_src.join("common/common.cpp"))
+        .file(&llama_src.join("common/json-schema-to-grammar.cpp"))
+        .file(&llama_src.join("common/log.cpp"))
+        .include(&llama_src.join("include"))
+        .include(&llama_src.join("ggml/include"))
+        .include(&llama_src.join("common"))
+        .include(&llama_src.join("vendor"))
+        .include(&llama_src);
+
+    // Add nlohmann/json include path
+    if cfg!(target_os = "macos") {
+        wrapper_build.include("/opt/homebrew/include");
+    }
+
+    wrapper_build
+        .opt_level(if profile == "Debug" { 0 } else { 2 })
+        .static_flag(true);
+
+    // Add target-specific flags
+    match target_os {
+        TargetOs::Windows(WindowsVariant::Msvc) => {
+            wrapper_build.flag("/std:c++17");
+            if static_crt {
+                wrapper_build.static_crt(true);
+            }
+        }
+        _ => {
+            wrapper_build.flag("-std=c++17");
+        }
+    }
+
+    wrapper_build.compile("chat_wrapper");
+
+    debug_log!("Chat wrapper compiled successfully");
 
     // Search paths
     println!("cargo:rustc-link-search={}", out_dir.join("lib").display());

@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-clap = { version = "4.5.4", features = ["derive"] }
+clap = { version = "4.5.50", features = ["derive"] }
 llama-cpp-2 = { path = "../../llama-cpp-2", features = ["metal"] }
 serde_json = "1.0.117"
 uuid = { version = "1.8.0", features = ["v4"] }
